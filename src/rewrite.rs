@@ -5,7 +5,7 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::Column;
 use datafusion::common::DFSchema;
-use datafusion::common::{plan_err, Result};
+use datafusion::common::Result;
 use datafusion::logical_expr::expr::{Alias, Cast, Expr, ScalarFunction};
 use datafusion::logical_expr::expr_rewriter::FunctionRewrite;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
@@ -129,8 +129,8 @@ impl TryFrom<&BinaryOperator> for JsonOperator {
 impl From<JsonOperator> for Arc<ScalarUDF> {
     fn from(op: JsonOperator) -> Arc<ScalarUDF> {
         match op {
-            // the path operators use the same functions as their single key counterparts;
-            // all that differs is the expanded argument list, built in `plan_binary_op`
+            // the path operators use the same functions as their single key counterparts, with
+            // the path passed as a list
             JsonOperator::Arrow | JsonOperator::HashArrow => crate::udfs::json_get_udf(),
             JsonOperator::LongArrow | JsonOperator::HashLongArrow => crate::udfs::json_as_text_udf(),
             JsonOperator::Question => crate::udfs::json_contains_udf(),
@@ -178,28 +178,6 @@ fn expr_to_sql_repr(expr: &Expr) -> String {
     }
 }
 
-/// Expand a postgres array literal on the right-hand side of a path operator (`#>`, `#>>`)
-/// into one key per element, so that `j #> '{a,b}'` becomes `json_get(j, 'a', 'b')`.
-///
-/// Only a string literal is handled here: `DataFusion` sees `'{a,b}'` as plain text, and
-/// nothing below us knows it is an array. Any other expression, such as `array['a', 'b']`
-/// or `array[$1]::text[]`, is returned as `None` and passed through whole; the functions
-/// accept a list of strings as a path at execution.
-fn path_elements(expr: &Expr) -> Result<Option<Vec<Expr>>> {
-    let Some(Some(literal)) = expr.as_literal().and_then(ScalarValue::try_as_str) else {
-        return Ok(None);
-    };
-    let Some(elements) = crate::pg_array::parse_array_literal(literal) else {
-        return plan_err!("malformed array literal: \"{literal}\"");
-    };
-    Ok(Some(
-        elements
-            .into_iter()
-            .map(|element| Expr::Literal(ScalarValue::Utf8(element), None))
-            .collect(),
-    ))
-}
-
 /// Implement a custom SQL planner to replace postgres JSON operators with custom UDFs
 #[derive(Debug, Default)]
 pub struct JsonExprPlanner;
@@ -210,15 +188,6 @@ impl ExprPlanner for JsonExprPlanner {
             return Ok(PlannerResult::Original(expr));
         };
 
-        let mut args = vec![expr.left.clone()];
-        match op {
-            JsonOperator::HashArrow | JsonOperator::HashLongArrow => match path_elements(&expr.right)? {
-                Some(elements) => args.extend(elements),
-                None => args.push(expr.right.clone()),
-            },
-            _ => args.push(expr.right.clone()),
-        }
-
         let left_repr = expr_to_sql_repr(&expr.left);
         let right_repr = expr_to_sql_repr(&expr.right);
 
@@ -226,7 +195,10 @@ impl ExprPlanner for JsonExprPlanner {
 
         // we put the alias in so that default column titles are `foo -> bar` instead of `json_get(foo, bar)`
         Ok(PlannerResult::Planned(Expr::Alias(Alias::new(
-            Expr::ScalarFunction(ScalarFunction { func: op.into(), args }),
+            Expr::ScalarFunction(ScalarFunction {
+                func: op.into(),
+                args: vec![expr.left, expr.right],
+            }),
             None::<&str>,
             alias_name,
         ))))
