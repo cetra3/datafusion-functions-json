@@ -649,3 +649,29 @@ fn mask_dictionary_keys(keys: &PrimitiveArray<Int64Type>, type_ids: &[i8]) -> Pr
     }
     PrimitiveArray::new(keys.values().clone(), Some(null_mask.into()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::ListArray;
+
+    #[test]
+    fn into_owned_keeps_non_key_steps() {
+        assert!(matches!(JsonPath::Index(-1).into_owned(), JsonPath::Index(-1)));
+        assert!(matches!(JsonPath::None.into_owned(), JsonPath::None));
+        assert!(matches!(JsonPath::from("a").into_owned(), JsonPath::Key(Cow::Owned(k)) if k == "a"));
+    }
+
+    #[test]
+    fn list_path_must_be_scalar() {
+        let two_rows = ListArray::from_iter_primitive::<Int64Type, _, _>([Some([Some(1)]), Some([Some(2)])]);
+        let args = [ColumnarValue::Scalar(ScalarValue::List(Arc::new(two_rows)))];
+        // a single array argument is a column of keys and takes the other path, so add a key
+        let args_with_key = [args[0].clone(), ColumnarValue::Scalar(ScalarValue::from("k"))];
+        let err = JsonPathArgs::extract_path(&args_with_key).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Execution error: Expected a scalar list as a JSON path, got 2 rows."
+        );
+    }
+}

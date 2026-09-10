@@ -3345,6 +3345,14 @@ async fn test_hash_long_arrow_index_or_key() {
 }
 
 #[tokio::test]
+async fn test_json_get_unsigned_index() {
+    let batches = run_query("select '[1, 2, 3]' -> arrow_cast(1, 'UInt64')")
+        .await
+        .unwrap();
+    assert_eq!(display_val(batches).await.1, "{int=2}");
+}
+
+#[tokio::test]
 async fn test_json_get_negative_index() {
     let batches = run_query("select '[1, 2, 3]' -> -1").await.unwrap();
     assert_eq!(display_val(batches).await.1, "{int=3}");
