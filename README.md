@@ -69,6 +69,22 @@ SELECT id, json_col->'a' as json_col_a FROM test_table
 - [x] `->` operator - alias for `json_get`
 - [x] `->>` operator - alias for `json_as_text`
 - [x] `?` operator - alias for `json_contains`
+- [x] `#>` operator - `json_get` over a path, so `a #> '{x,y}'` is `a -> 'x' -> 'y'`
+- [x] `#>>` operator - `json_as_text` over a path, so `a #>> '{x,y}'` is `a -> 'x' ->> 'y'`
+
+The right-hand side of a path operator is a `text[]`, written as a postgres array literal
+or as any list expression, so these are equivalent:
+
+```sql
+select json_col #>> '{a,b}' from test_table;
+select json_col #>> array['a', 'b'] from test_table;
+select json_col #>> array['a', 'b']::text[] from test_table;
+```
+
+As in postgres, each element is a key when it reaches an object and an index when it
+reaches an array, so `'{items,0,name}'` walks to `items`, then element zero, then `name`.
+A negative index counts from the end of the array. The `json_get*` and `json_as_text`
+functions accept the same list as a path, e.g. `json_as_text(json_col, array['a', 'b'])`.
 
 ### Notes
 Cast expressions with `json_get` are rewritten to the appropriate method, e.g.

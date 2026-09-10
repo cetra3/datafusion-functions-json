@@ -21,6 +21,7 @@ mod json_get_str;
 mod json_length;
 mod json_object_keys;
 mod json_union_to_text;
+mod pg_array;
 mod rewrite;
 
 pub use common_union::{json_field_metadata, JsonUnionEncoder, JsonUnionValue, JSON_UNION_DATA_TYPE};

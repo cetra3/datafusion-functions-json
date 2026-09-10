@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::str::Utf8Error;
 use std::sync::Arc;
 
@@ -34,7 +35,7 @@ pub fn return_type_check(args: &[DataType], fn_name: &str, value_type: DataType)
         return plan_err!("Unexpected argument type to '{fn_name}' at position 1, expected a string, got {first:?}.");
     }
     args.iter().skip(1).enumerate().try_for_each(|(index, arg)| {
-        if is_str(arg) || is_int(arg) || dict_key_type(arg).is_some() {
+        if is_str(arg) || is_int(arg) || is_str_list(arg) || dict_key_type(arg).is_some() {
             Ok(())
         } else {
             plan_err!(
@@ -59,6 +60,12 @@ fn is_int(d: &DataType) -> bool {
     matches!(d, DataType::UInt64 | DataType::Int64)
 }
 
+/// A list of strings, usable as a whole path, e.g. `array['a', 'b']` or `'{a,b}'::text[]`.
+/// `Null` elements are what an unbound placeholder such as `array[$1]` has at planning time.
+fn is_str_list(d: &DataType) -> bool {
+    matches!(d, DataType::List(field) if is_str(field.data_type()) || field.data_type() == &DataType::Null)
+}
+
 fn dict_key_type(d: &DataType) -> Option<DataType> {
     if let DataType::Dictionary(key, value) = d {
         if is_str(value) || is_json_union(value) {
@@ -70,29 +77,37 @@ fn dict_key_type(d: &DataType) -> Option<DataType> {
 
 #[derive(Debug)]
 pub enum JsonPath<'s> {
-    Key(&'s str),
-    Index(usize),
+    Key(Cow<'s, str>),
+    /// A negative index counts from the end of the array, as in postgres.
+    Index(isize),
     None,
+}
+
+impl JsonPath<'_> {
+    fn into_owned(self) -> JsonPath<'static> {
+        match self {
+            JsonPath::Key(key) => JsonPath::Key(Cow::Owned(key.into_owned())),
+            JsonPath::Index(index) => JsonPath::Index(index),
+            JsonPath::None => JsonPath::None,
+        }
+    }
 }
 
 impl<'a> From<&'a str> for JsonPath<'a> {
     fn from(key: &'a str) -> Self {
-        JsonPath::Key(key)
+        JsonPath::Key(Cow::Borrowed(key))
     }
 }
 
 impl From<u64> for JsonPath<'_> {
     fn from(index: u64) -> Self {
-        JsonPath::Index(usize::try_from(index).unwrap())
+        isize::try_from(index).map_or(JsonPath::None, JsonPath::Index)
     }
 }
 
 impl From<i64> for JsonPath<'_> {
     fn from(index: i64) -> Self {
-        match usize::try_from(index) {
-            Ok(i) => Self::Index(i),
-            Err(_) => Self::None,
-        }
+        isize::try_from(index).map_or(JsonPath::None, JsonPath::Index)
     }
 }
 
@@ -109,35 +124,47 @@ impl<'s> JsonPathArgs<'s> {
             return Ok(Self::Array(array));
         }
 
-        path_args
-            .iter()
-            .enumerate()
-            .map(|(pos, arg)| match arg {
-                ColumnarValue::Scalar(
-                    ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)),
-                ) => Ok(JsonPath::Key(s)),
-                ColumnarValue::Scalar(ScalarValue::UInt64(Some(i))) => Ok((*i).into()),
-                ColumnarValue::Scalar(ScalarValue::Int64(Some(i))) => Ok((*i).into()),
-                ColumnarValue::Scalar(
-                    ScalarValue::Null
-                    | ScalarValue::Utf8(None)
-                    | ScalarValue::Utf8View(None)
-                    | ScalarValue::LargeUtf8(None)
-                    | ScalarValue::UInt64(None)
-                    | ScalarValue::Int64(None),
-                ) => Ok(JsonPath::None),
+        let mut path = Vec::with_capacity(path_args.len());
+        for (pos, arg) in path_args.iter().enumerate() {
+            match arg {
+                ColumnarValue::Scalar(ScalarValue::List(list)) => {
+                    // a whole path as one list, e.g. `array['a', 'b']`; each element is a step
+                    if list.len() != 1 {
+                        return exec_err!("Expected a scalar list as a JSON path, got {} rows.", list.len());
+                    }
+                    let elements = list.value(0);
+                    for i in 0..elements.len() {
+                        let element = ScalarValue::try_from_array(&elements, i)?;
+                        path.push(scalar_path(&element, pos)?.into_owned());
+                    }
+                }
+                ColumnarValue::Scalar(scalar) => path.push(scalar_path(scalar, pos)?),
                 ColumnarValue::Array(_) => {
                     // if there was a single arg, which is an array, handled above in the
                     // split_first case. So this is multiple args of which one is an array
-                    exec_err!("More than 1 path element is not supported when querying JSON using an array.")
+                    return exec_err!("More than 1 path element is not supported when querying JSON using an array.");
                 }
-                ColumnarValue::Scalar(arg) => exec_err!(
-                    "Unexpected argument type at position {}, expected string or int, got {arg:?}.",
-                    pos + 1
-                ),
-            })
-            .collect::<DataFusionResult<_>>()
-            .map(JsonPathArgs::Scalars)
+            }
+        }
+        Ok(Self::Scalars(path))
+    }
+}
+
+/// One path step from a scalar: a string is a key, an integer an index, and a null a null step.
+fn scalar_path(scalar: &ScalarValue, pos: usize) -> DataFusionResult<JsonPath<'_>> {
+    if scalar.is_null() {
+        return Ok(JsonPath::None);
+    }
+    if let Some(Some(key)) = scalar.try_as_str() {
+        return Ok(key.into());
+    }
+    match scalar {
+        ScalarValue::UInt64(Some(i)) => Ok((*i).into()),
+        ScalarValue::Int64(Some(i)) => Ok((*i).into()),
+        other => exec_err!(
+            "Unexpected argument type at position {}, expected string or int, got {other:?}.",
+            pos + 1
+        ),
     }
 }
 
@@ -527,8 +554,8 @@ pub fn jiter_json_find<'j>(opt_json: Option<&'j str>, path: &[JsonPath]) -> Opti
     let mut jiter = Jiter::new(json_str.as_bytes());
     let mut peek = jiter.peek().ok()?;
     for element in path {
-        match element {
-            JsonPath::Key(key) if peek == Peek::Object => {
+        match (element, peek) {
+            (JsonPath::Key(key), Peek::Object) => {
                 let mut next_key = jiter.known_object().ok()??;
 
                 while next_key != *key {
@@ -538,22 +565,48 @@ pub fn jiter_json_find<'j>(opt_json: Option<&'j str>, path: &[JsonPath]) -> Opti
 
                 peek = jiter.peek().ok()?;
             }
-            JsonPath::Index(index) if peek == Peek::Array => {
-                let mut array_item = jiter.known_array().ok()??;
-
-                for _ in 0..*index {
-                    jiter.known_skip(array_item).ok()?;
-                    array_item = jiter.array_step().ok()??;
-                }
-
-                peek = array_item;
-            }
-            _ => {
-                return None;
-            }
+            (JsonPath::Index(index), Peek::Array) => peek = jiter_array_step(&mut jiter, *index)?,
+            // as in postgres's path operators, a text element which reaches an array is
+            // used as an index if it spells one, e.g. `j #> '{a,0}'`
+            (JsonPath::Key(key), Peek::Array) => peek = jiter_array_step(&mut jiter, key.parse().ok()?)?,
+            _ => return None,
         }
     }
     Some((jiter, peek))
+}
+
+/// Step into the array `jiter` is positioned at and advance to element `index`.
+///
+/// A negative index counts from the end. jiter only streams forward, so that case first
+/// counts the elements on a clone of the parser; a non-negative index is a single pass.
+fn jiter_array_step(jiter: &mut Jiter, index: isize) -> Option<Peek> {
+    let index = if let Ok(index) = usize::try_from(index) {
+        index
+    } else {
+        let len = jiter_array_len(&mut jiter.clone()).ok()?;
+        len.checked_add_signed(index)?
+    };
+
+    let mut array_item = jiter.known_array().ok()??;
+
+    for _ in 0..index {
+        jiter.known_skip(array_item).ok()?;
+        array_item = jiter.array_step().ok()??;
+    }
+
+    Some(array_item)
+}
+
+/// Count the elements of the array `jiter` is positioned at, consuming it.
+pub fn jiter_array_len(jiter: &mut Jiter) -> Result<usize, JiterError> {
+    let mut peek_opt = jiter.known_array()?;
+    let mut len = 0;
+    while let Some(peek) = peek_opt {
+        jiter.known_skip(peek)?;
+        len += 1;
+        peek_opt = jiter.array_step()?;
+    }
+    Ok(len)
 }
 
 macro_rules! get_err {
