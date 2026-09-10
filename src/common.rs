@@ -35,7 +35,7 @@ pub fn return_type_check(args: &[DataType], fn_name: &str, value_type: DataType)
         return plan_err!("Unexpected argument type to '{fn_name}' at position 1, expected a string, got {first:?}.");
     }
     args.iter().skip(1).enumerate().try_for_each(|(index, arg)| {
-        if is_str(arg) || is_int(arg) || is_str_list(arg) || dict_key_type(arg).is_some() {
+        if is_str(arg) || is_int(arg) || is_path_list(arg) || dict_key_type(arg).is_some() {
             Ok(())
         } else {
             plan_err!(
@@ -60,10 +60,11 @@ fn is_int(d: &DataType) -> bool {
     matches!(d, DataType::UInt64 | DataType::Int64)
 }
 
-/// A list of strings, usable as a whole path, e.g. `array['a', 'b']` or `'{a,b}'::text[]`.
-/// `Null` elements are what an unbound placeholder such as `array[$1]` has at planning time.
-fn is_str_list(d: &DataType) -> bool {
-    matches!(d, DataType::List(field) if is_str(field.data_type()) || field.data_type() == &DataType::Null)
+/// A list usable as a whole path, e.g. `array['a', 'b']` or `array[0, 1]`, with one step per
+/// element. `Null` elements are what an unbound placeholder such as `array[$1]` has at
+/// planning time.
+fn is_path_list(d: &DataType) -> bool {
+    matches!(d, DataType::List(field) if is_str(field.data_type()) || is_int(field.data_type()) || field.data_type() == &DataType::Null)
 }
 
 fn dict_key_type(d: &DataType) -> Option<DataType> {
@@ -128,7 +129,9 @@ impl<'s> JsonPathArgs<'s> {
         for (pos, arg) in path_args.iter().enumerate() {
             match arg {
                 ColumnarValue::Scalar(ScalarValue::List(list)) => {
-                    // a whole path as one list, e.g. `array['a', 'b']`; each element is a step
+                    // a whole path as one list, e.g. `array['a', 'b']`, with one step per element.
+                    // There are two levels here: a scalar list is a `ListArray` holding exactly
+                    // one row, and `value(0)` unwraps that row into the array of its elements
                     if list.len() != 1 {
                         return exec_err!("Expected a scalar list as a JSON path, got {} rows.", list.len());
                     }
@@ -598,7 +601,7 @@ fn jiter_array_step(jiter: &mut Jiter, index: isize) -> Option<Peek> {
 }
 
 /// Count the elements of the array `jiter` is positioned at, consuming it.
-pub fn jiter_array_len(jiter: &mut Jiter) -> Result<usize, JiterError> {
+pub(crate) fn jiter_array_len(jiter: &mut Jiter) -> Result<usize, JiterError> {
     let mut peek_opt = jiter.known_array()?;
     let mut len = 0;
     while let Some(peek) = peek_opt {
@@ -664,6 +667,7 @@ mod tests {
 
     #[test]
     fn list_path_must_be_scalar() {
+        // two rows, `[[1], [2]]`, where a scalar list has one
         let two_rows = ListArray::from_iter_primitive::<Int64Type, _, _>([Some([Some(1)]), Some([Some(2)])]);
         let args = [ColumnarValue::Scalar(ScalarValue::List(Arc::new(two_rows)))];
         // a single array argument is a column of keys and takes the other path, so add a key

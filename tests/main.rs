@@ -3157,6 +3157,21 @@ async fn test_hash_arrow_equivalent_to_arrow_chain() {
 }
 
 #[tokio::test]
+async fn test_hash_long_arrow_integer_list() {
+    // a list of integers is a path of indices; a list is homogeneous, so a mixed path spells
+    // its indices as text and relies on the index-or-key rule instead
+    let batches = run_query("select '[[1, 2], [3, 4]]' #>> array[1, 0]").await.unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Utf8, "3".to_string()));
+
+    let batches = run_query("select '[[1, 2], [3, 4]]' #>> array[-1, -1]").await.unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Utf8, "4".to_string()));
+
+    let sql = r#"select '{"a": [{"b": "x"}]}' #>> array['a', '0', 'b']"#;
+    let batches = run_query(sql).await.unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Utf8, "x".to_string()));
+}
+
+#[tokio::test]
 async fn test_hash_long_arrow_null_element() {
     // a null path element is null overall, as in postgres
     let batches = run_query(&format!("select {NESTED} #>> array['a', null]"))

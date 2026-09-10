@@ -82,9 +82,10 @@ select json_col #>> $1::text[] from test_table;
 
 Postgres's array literal syntax, `'{a,b}'`, is not supported. As in postgres, each element is
 a key when it reaches an object and an index when it reaches an array, so
-`array['items', '0', 'name']` walks to `items`, then element zero, then `name`. A negative
-index counts from the end of the array. The `json_get*` and `json_as_text` functions accept
-the same list as a path, e.g. `json_as_text(json_col, array['a', 'b'])`.
+`array['items', '0', 'name']` walks to `items`, then element zero, then `name`. A list of
+integers is a path of indices, and a negative index counts from the end of the array. The
+`json_get*` and `json_as_text` functions accept the same list as a path, e.g.
+`json_as_text(json_col, array['a', 'b'])`.
 
 ### Notes
 Cast expressions with `json_get` are rewritten to the appropriate method, e.g.
